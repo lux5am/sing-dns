@@ -26,6 +26,7 @@ func init() {
 
 type TLSUpstream struct {
 	myUpstreamAdapter
+	insecure bool
 }
 
 func NewTLSUpstream(options UpstreamOptions) (*TLSUpstream, error) {
@@ -41,7 +42,8 @@ func NewTLSUpstream(options UpstreamOptions) (*TLSUpstream, error) {
 		serverAddr.Port = 853
 	}
 	upstream := &TLSUpstream{
-		newUpstreamAdapter(options, serverAddr),
+		myUpstreamAdapter: newUpstreamAdapter(options, serverAddr),
+		insecure:          options.Insecure,
 	}
 	upstream.handler = upstream
 	return upstream, nil
@@ -53,7 +55,8 @@ func (t *TLSUpstream) DialContext(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 	tlsConn := tls.Client(conn, &tls.Config{
-		ServerName: t.serverAddr.AddrString(),
+		ServerName:         t.serverAddr.AddrString(),
+		InsecureSkipVerify: t.insecure,
 	})
 	err = tlsConn.HandshakeContext(ctx)
 	if err != nil {
