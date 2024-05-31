@@ -3,6 +3,7 @@ package dns
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -38,6 +39,9 @@ func NewHTTPSUpstream(options UpstreamOptions) *HTTPSUpstream {
 			ForceAttemptHTTP2: true,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return options.Dialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
+			},
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: options.Insecure,
 			},
 		},
 	}
