@@ -24,8 +24,12 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, destina
 	if destination.IsIP() {
 		return d.dialer.DialContext(ctx, network, destination)
 	}
+	fqdn := destination.Fqdn
 	destination.Fqdn = d.client.GetExactDomainFromHosts(ctx, destination.Fqdn, false)
 	if addresses := d.client.GetAddrsFromHosts(ctx, destination.Fqdn, DomainStrategyAsIS, false); len(addresses) > 0 {
+		if fqdn != "" {
+			ctx = context.WithValue(ctx, "DialerFqdn", fqdn)
+		}
 		return N.DialParallel(ctx, d.dialer, network, destination, addresses, false, d.fallbackDelay)
 	}
 	return nil, E.New("Invalid address")
@@ -35,8 +39,12 @@ func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksadd
 	if destination.IsIP() {
 		return d.dialer.ListenPacket(ctx, destination)
 	}
+	fqdn := destination.Fqdn
 	destination.Fqdn = d.client.GetExactDomainFromHosts(ctx, destination.Fqdn, false)
 	if addresses := d.client.GetAddrsFromHosts(ctx, destination.Fqdn, DomainStrategyAsIS, false); len(addresses) > 0 {
+		if fqdn != "" {
+			ctx = context.WithValue(ctx, "DialerFqdn", fqdn)
+		}
 		conn, _, err := N.ListenSerial(ctx, d.dialer, destination, addresses)
 		return conn, err
 	}
@@ -58,13 +66,20 @@ func (d *DialerWrapper) DialContext(ctx context.Context, network string, destina
 	if destination.IsIP() {
 		return d.dialer.DialContext(ctx, network, destination)
 	}
+	fqdn := destination.Fqdn
 	destination.Fqdn = d.client.GetExactDomainFromHosts(ctx, destination.Fqdn, false)
 	if addresses := d.client.GetAddrsFromHosts(ctx, destination.Fqdn, d.strategy, false); len(addresses) > 0 {
+		if fqdn != "" {
+			ctx = context.WithValue(ctx, "DialerFqdn", fqdn)
+		}
 		return N.DialParallel(ctx, d.dialer, network, destination, addresses, d.strategy == DomainStrategyPreferIPv6, d.fallbackDelay)
 	}
 	addresses, err := d.client.Lookup(ctx, d.transport, destination.Fqdn, d.strategy)
 	if err != nil {
 		return nil, err
+	}
+	if fqdn != "" {
+		ctx = context.WithValue(ctx, "DialerFqdn", fqdn)
 	}
 	return N.DialParallel(ctx, d.dialer, network, destination, addresses, d.strategy == DomainStrategyPreferIPv6, d.fallbackDelay)
 }
@@ -73,14 +88,21 @@ func (d *DialerWrapper) ListenPacket(ctx context.Context, destination M.Socksadd
 	if destination.IsIP() {
 		return d.dialer.ListenPacket(ctx, destination)
 	}
+	fqdn := destination.Fqdn
 	destination.Fqdn = d.client.GetExactDomainFromHosts(ctx, destination.Fqdn, false)
 	if addresses := d.client.GetAddrsFromHosts(ctx, destination.Fqdn, DomainStrategyAsIS, false); len(addresses) > 0 {
+		if fqdn != "" {
+			ctx = context.WithValue(ctx, "DialerFqdn", fqdn)
+		}
 		conn, _, err := N.ListenSerial(ctx, d.dialer, destination, addresses)
 		return conn, err
 	}
 	addresses, err := d.client.Lookup(ctx, d.transport, destination.Fqdn, d.strategy)
 	if err != nil {
 		return nil, err
+	}
+	if fqdn != "" {
+		ctx = context.WithValue(ctx, "DialerFqdn", fqdn)
 	}
 	conn, _, err := N.ListenSerial(ctx, d.dialer, destination, addresses)
 	return conn, err
