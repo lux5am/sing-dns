@@ -12,6 +12,7 @@ func FixedResponse(id uint16, question dns.Question, addresses []netip.Addr, tim
 			Id:       id,
 			Rcode:    dns.RcodeSuccess,
 			Response: true,
+			Authoritative: true,
 		},
 		Question: []dns.Question{question},
 	}
