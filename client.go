@@ -178,6 +178,9 @@ func (c *Client) SearchCNAMEHosts(ctx context.Context, message *dns.Msg) (*dns.M
 		MsgHdr: dns.MsgHdr{
 			Id:       message.Id,
 			Response: true,
+			Authoritative: true,
+			RecursionDesired: true,
+			RecursionAvailable: true,
 			Rcode:    dns.RcodeSuccess,
 		},
 		Question: []dns.Question{question},
@@ -218,6 +221,9 @@ func (c *Client) SearchIPHosts(ctx context.Context, message *dns.Msg, strategy D
 		MsgHdr: dns.MsgHdr{
 			Id:       message.Id,
 			Response: true,
+			Authoritative: true,
+			RecursionDesired: true,
+			RecursionAvailable: true,
 			Rcode:    dns.RcodeSuccess,
 		},
 		Question: []dns.Question{question},
@@ -322,6 +328,9 @@ func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transp
 			MsgHdr: dns.MsgHdr{
 				Id:       message.Id,
 				Response: true,
+				Authoritative: true,
+				RecursionDesired: true,
+				RecursionAvailable: true,
 				Rcode:    dns.RcodeSuccess,
 			},
 			Question: []dns.Question{question},
@@ -397,6 +406,7 @@ func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transp
 		}
 	}
 	response.Id = messageId
+	response.MsgHdr.Authoritative = true
 	if !disableCache {
 		c.storeCache(transport, question, response, timeToLive)
 	}
