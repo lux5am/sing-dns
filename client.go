@@ -98,6 +98,8 @@ type Client struct {
 	disableExpire    bool
 	independentCache bool
 	roundRobinCache  bool
+	minCacheTTL      uint32
+	maxCacheTTL      uint32
 	hosts            *Hosts
 	rdrc             RDRCStore
 	initRDRCFunc     func() RDRCStore
@@ -199,6 +201,8 @@ type ClientOptions struct {
 	DisableExpire    bool
 	IndependentCache bool
 	RoundRobinCache  bool
+	MinCacheTTL      uint32
+	MaxCacheTTL      uint32
 	CacheCapacity    uint32
 	Hosts            *Hosts
 	RDRC             func() RDRCStore
@@ -212,9 +216,17 @@ func NewClient(options ClientOptions) *Client {
 		disableExpire:    options.DisableExpire,
 		independentCache: options.IndependentCache,
 		roundRobinCache:  options.RoundRobinCache,
+		minCacheTTL:      options.MinCacheTTL,
+		maxCacheTTL:      options.MaxCacheTTL,
 		hosts:            options.Hosts,
 		initRDRCFunc:     options.RDRC,
 		logger:           options.Logger,
+	}
+	if client.maxCacheTTL == 0 {
+		client.maxCacheTTL = 86400
+	}
+	if client.minCacheTTL > client.maxCacheTTL {
+		client.maxCacheTTL = client.minCacheTTL
 	}
 	if client.timeout == 0 {
 		client.timeout = DefaultTimeout
@@ -511,6 +523,12 @@ func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transp
 				timeToLive = record.Header().Ttl
 			}
 		}
+	}
+	if timeToLive < c.minCacheTTL {
+		timeToLive = c.minCacheTTL
+	}
+	if timeToLive > c.maxCacheTTL {
+		timeToLive = c.maxCacheTTL
 	}
 	if options.RewriteTTL != nil {
 		timeToLive = *options.RewriteTTL
