@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing/common"
@@ -31,8 +32,22 @@ var (
 
 type Hosts struct {
 	CNAMEHosts map[string]string
-	IPv4Hosts  map[string][]netip.Addr
-	IPv6Hosts  map[string][]netip.Addr
+	IPv4Hosts  map[string]*ipHosts
+	IPv6Hosts  map[string]*ipHosts
+}
+
+type ipHosts struct {
+	index int32
+	addrs []netip.Addr
+}
+
+func (ih *ipHosts) RoundRobin() []netip.Addr {
+	if len(ih.addrs) == 1 {
+		return ih.addrs
+	}
+	i := atomic.AddInt32(&ih.index, 1)
+	start := int(i-1) % len(ih.addrs)
+	return append(ih.addrs[start:], ih.addrs[:start]...)
 }
 
 func NewHosts(hostsMap map[string][]string) (*Hosts, error) {
@@ -41,8 +56,8 @@ func NewHosts(hostsMap map[string][]string) (*Hosts, error) {
 	}
 	hosts := Hosts{
 		CNAMEHosts: make(map[string]string),
-		IPv4Hosts:  make(map[string][]netip.Addr),
-		IPv6Hosts:  make(map[string][]netip.Addr),
+		IPv4Hosts:  make(map[string]*ipHosts),
+		IPv6Hosts:  make(map[string]*ipHosts),
 	}
 	for domain, addrs := range hostsMap {
 		var ipv4Addr, ipv6Addr []netip.Addr
@@ -67,10 +82,10 @@ func NewHosts(hostsMap map[string][]string) (*Hosts, error) {
 			}
 		}
 		if len(ipv4Addr) > 0 {
-			hosts.IPv4Hosts[domain] = ipv4Addr
+			hosts.IPv4Hosts[domain] = &ipHosts{addrs: ipv4Addr}
 		}
 		if len(ipv6Addr) > 0 {
-			hosts.IPv6Hosts[domain] = ipv6Addr
+			hosts.IPv6Hosts[domain] = &ipHosts{addrs: ipv6Addr}
 		}
 	}
 	return &hosts, nil
@@ -81,18 +96,95 @@ type Client struct {
 	disableCache     bool
 	disableExpire    bool
 	independentCache bool
+	roundRobinCache  bool
 	hosts            *Hosts
 	rdrc             RDRCStore
 	initRDRCFunc     func() RDRCStore
 	logger           logger.ContextLogger
-	cache            *cache.LruCache[dns.Question, *dns.Msg]
-	transportCache   *cache.LruCache[transportCacheKey, *dns.Msg]
+	cache            *cache.LruCache[dns.Question, *dnsMsg]
+	transportCache   *cache.LruCache[transportCacheKey, *dnsMsg]
 }
 
 type RDRCStore interface {
 	LoadRDRC(transportName string, qName string, qType uint16) (rejected bool)
 	SaveRDRC(transportName string, qName string, qType uint16) error
 	SaveRDRCAsync(transportName string, qName string, qType uint16, logger logger.Logger)
+}
+
+type dnsMsg struct {
+	ipv4Index int32
+	ipv6Index int32
+	msg       *dns.Msg
+}
+
+func removeAnswersOfType(answers []dns.RR, rrType uint16) []dns.RR {
+	var filteredAnswers []dns.RR
+	for _, ans := range answers {
+		if ans.Header().Rrtype != rrType {
+			filteredAnswers = append(filteredAnswers, ans)
+		}
+	}
+	return filteredAnswers
+}
+
+func (dm *dnsMsg) RoundRobin() *dns.Msg {
+	var (
+		ipv4Answers []*dns.A
+		ipv6Answers []*dns.AAAA
+	)
+	for _, ans := range dm.msg.Answer {
+		switch a := ans.(type) {
+		case *dns.A:
+			ipv4Answers = append(ipv4Answers, a)
+		case *dns.AAAA:
+			ipv6Answers = append(ipv6Answers, a)
+		}
+	}
+	rotatedMsg := dm.msg.Copy()
+	if len(ipv4Answers) > 1 {
+		atomic.AddInt32(&dm.ipv4Index, 1)
+		rotatedIPv4 := dm.rotateSlice(ipv4Answers, dm.ipv4Index)
+		rotatedMsg.Answer = removeAnswersOfType(rotatedMsg.Answer, dns.TypeA)
+		if ipv4List, ok := rotatedIPv4.([]*dns.A); ok {
+			for _, ipv4 := range ipv4List {
+				rotatedMsg.Answer = append(rotatedMsg.Answer, ipv4)
+			}
+		}
+	}
+	if len(ipv6Answers) > 1 {
+		atomic.AddInt32(&dm.ipv6Index, 1)
+		rotatedIPv6 := dm.rotateSlice(ipv6Answers, dm.ipv6Index)
+		rotatedMsg.Answer = removeAnswersOfType(rotatedMsg.Answer, dns.TypeAAAA)
+		if ipv6List, ok := rotatedIPv6.([]*dns.AAAA); ok {
+			for _, ipv6 := range ipv6List {
+				rotatedMsg.Answer = append(rotatedMsg.Answer, ipv6)
+			}
+		}
+	}
+	return rotatedMsg
+}
+
+func (dm *dnsMsg) rotateSlice(slice interface{}, index int32) interface{} {
+	var rotatedSlice interface{}
+	switch v := slice.(type) {
+	case []*dns.A:
+		if len(v) > 1 {
+			index = index % int32(len(v))
+			rotatedSlice = append([]*dns.A{}, v[index:]...)  // Copy the rotated part
+			rotatedSlice = append(rotatedSlice.([]*dns.A), v[:index]...)  // Add the rest
+		} else {
+			rotatedSlice = append([]*dns.A{}, v...)  // If only one element, return it as is
+		}
+	case []*dns.AAAA:
+		if len(v) > 1 {
+			index = index % int32(len(v))
+			rotatedSlice = append([]*dns.AAAA{}, v[index:]...)  // Copy the rotated part
+			rotatedSlice = append(rotatedSlice.([]*dns.AAAA), v[:index]...)  // Add the rest
+		} else {
+			rotatedSlice = append([]*dns.AAAA{}, v...)  // If only one element, return it as is
+		}
+	}
+	return rotatedSlice
 }
 
 type transportCacheKey struct {
@@ -105,6 +197,7 @@ type ClientOptions struct {
 	DisableCache     bool
 	DisableExpire    bool
 	IndependentCache bool
+	RoundRobinCache  bool
 	Hosts            *Hosts
 	RDRC             func() RDRCStore
 	Logger           logger.ContextLogger
@@ -116,6 +209,7 @@ func NewClient(options ClientOptions) *Client {
 		disableCache:     options.DisableCache,
 		disableExpire:    options.DisableExpire,
 		independentCache: options.IndependentCache,
+		roundRobinCache:  options.RoundRobinCache,
 		hosts:            options.Hosts,
 		initRDRCFunc:     options.RDRC,
 		logger:           options.Logger,
@@ -125,9 +219,9 @@ func NewClient(options ClientOptions) *Client {
 	}
 	if !client.disableCache {
 		if !client.independentCache {
-			client.cache = cache.New[dns.Question, *dns.Msg]()
+			client.cache = cache.New[dns.Question, *dnsMsg]()
 		} else {
-			client.transportCache = cache.New[transportCacheKey, *dns.Msg]()
+			client.transportCache = cache.New[transportCacheKey, *dnsMsg]()
 		}
 	}
 	return client
@@ -242,8 +336,14 @@ func (c *Client) SearchIPHosts(ctx context.Context, message *dns.Msg, strategy D
 			}
 			break
 		}
-		c.printIPHostsLog(ctx, domain, ipv4Addrs, false)
-		for _, addr := range ipv4Addrs {
+		var ipAddrs []netip.Addr
+		if !c.roundRobinCache {
+			ipAddrs = ipv4Addrs.addrs
+		} else {
+			ipAddrs = ipv4Addrs.RoundRobin()
+		}
+		c.printIPHostsLog(ctx, domain, ipAddrs, false)
+		for _, addr := range ipAddrs {
 			record := addr.AsSlice()
 			response.Answer = append(response.Answer, &dns.A{
 				Hdr: dns.RR_Header{
@@ -266,8 +366,14 @@ func (c *Client) SearchIPHosts(ctx context.Context, message *dns.Msg, strategy D
 			}
 			break
 		}
-		c.printIPHostsLog(ctx, domain, ipv6Addrs, false)
-		for _, addr := range ipv6Addrs {
+		var ipAddrs []netip.Addr
+		if !c.roundRobinCache {
+			ipAddrs = ipv6Addrs.addrs
+		} else {
+			ipAddrs = ipv6Addrs.RoundRobin()
+		}
+		c.printIPHostsLog(ctx, domain, ipAddrs, false)
+		for _, addr := range ipAddrs {
 			record := addr.AsSlice()
 			response.Answer = append(response.Answer, &dns.A{
 				Hdr: dns.RR_Header{
@@ -442,12 +548,24 @@ func (c *Client) GetAddrsFromHosts(ctx context.Context, domain string, stategy D
 		return nil
 	}
 	if hasIPv4 && stategy != DomainStrategyUseIPv6 {
-		c.printIPHostsLog(ctx, domain, ipv4Addrs, nolog)
-		addrs = append(addrs, ipv4Addrs...)
+		ipAddrs := ipv4Addrs.addrs
+		if !c.roundRobinCache {
+			ipAddrs = ipv4Addrs.addrs
+		} else {
+			ipAddrs = ipv4Addrs.RoundRobin()
+		}
+		c.printIPHostsLog(ctx, domain, ipAddrs, nolog)
+		addrs = append(addrs, ipAddrs...)
 	}
 	if hasIPv6 && stategy != DomainStrategyUseIPv4 {
-		c.printIPHostsLog(ctx, domain, ipv6Addrs, nolog)
-		addrs = append(addrs, ipv6Addrs...)
+		var ipAddrs []netip.Addr
+		if !c.roundRobinCache {
+			ipAddrs = ipv6Addrs.addrs
+		} else {
+			ipAddrs = ipv6Addrs.RoundRobin()
+		}
+		c.printIPHostsLog(ctx, domain, ipAddrs, nolog)
+		addrs = append(addrs, ipAddrs...)
 	}
 	return addrs
 }
@@ -727,23 +845,23 @@ func (c *Client) storeCache(transport Transport, question dns.Question, message 
 	}
 	if c.disableExpire {
 		if !c.independentCache {
-			c.cache.Store(question, message)
+			c.cache.Store(question, &dnsMsg{msg: message})
 		} else {
 			c.transportCache.Store(transportCacheKey{
 				Question:      question,
 				transportName: transport.Name(),
-			}, message)
+			}, &dnsMsg{msg: message})
 		}
 		return
 	}
 	expireAt := time.Now().Add(time.Second * time.Duration(timeToLive))
 	if !c.independentCache {
-		c.cache.StoreWithExpire(question, message, expireAt)
+		c.cache.StoreWithExpire(question, &dnsMsg{msg: message}, expireAt)
 	} else {
 		c.transportCache.StoreWithExpire(transportCacheKey{
 			Question:      question,
 			transportName: transport.Name(),
-		}, message, expireAt)
+		}, &dnsMsg{msg: message}, expireAt)
 	}
 }
 
@@ -816,16 +934,25 @@ func (c *Client) questionCache(question dns.Question, transport Transport) ([]ne
 	return MessageToAddresses(response)
 }
 
+func (c *Client) getRoundRobin(response *dnsMsg) *dns.Msg {
+	if c.roundRobinCache {
+		return response.RoundRobin()
+	} else {
+		return response.msg.Copy()
+	}
+}
+
 func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.Msg, int) {
 	var (
+		resp     *dnsMsg
 		response *dns.Msg
 		loaded   bool
 	)
 	if c.disableExpire {
 		if !c.independentCache {
-			response, loaded = c.cache.Load(question)
+			resp, loaded = c.cache.Load(question)
 		} else {
-			response, loaded = c.transportCache.Load(transportCacheKey{
+			resp, loaded = c.transportCache.Load(transportCacheKey{
 				Question:      question,
 				transportName: transport.Name(),
 			})
@@ -833,13 +960,13 @@ func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.
 		if !loaded {
 			return nil, 0
 		}
-		return response.Copy(), 0
+		return c.getRoundRobin(resp), 0
 	} else {
 		var expireAt time.Time
 		if !c.independentCache {
-			response, expireAt, loaded = c.cache.LoadWithExpire(question)
+			resp, expireAt, loaded = c.cache.LoadWithExpire(question)
 		} else {
-			response, expireAt, loaded = c.transportCache.LoadWithExpire(transportCacheKey{
+			resp, expireAt, loaded = c.transportCache.LoadWithExpire(transportCacheKey{
 				Question:      question,
 				transportName: transport.Name(),
 			})
@@ -859,6 +986,7 @@ func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.
 			}
 			return nil, 0
 		}
+		response = c.getRoundRobin(resp)
 		var originTTL int
 		for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
 			for _, record := range recordList {
@@ -871,7 +999,6 @@ func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.
 		if nowTTL < 0 {
 			nowTTL = 0
 		}
-		response = response.Copy()
 		if originTTL > 0 {
 			duration := uint32(originTTL - nowTTL)
 			for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
