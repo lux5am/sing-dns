@@ -97,6 +97,8 @@ type Client struct {
 	disableExpire    bool
 	independentCache bool
 	roundRobinCache  bool
+	minCacheTTL      uint32
+	maxCacheTTL      uint32
 	hosts            *Hosts
 	rdrc             RDRCStore
 	initRDRCFunc     func() RDRCStore
@@ -198,6 +200,8 @@ type ClientOptions struct {
 	DisableExpire    bool
 	IndependentCache bool
 	RoundRobinCache  bool
+	MinCacheTTL      uint32
+	MaxCacheTTL      uint32
 	Hosts            *Hosts
 	RDRC             func() RDRCStore
 	Logger           logger.ContextLogger
@@ -210,9 +214,17 @@ func NewClient(options ClientOptions) *Client {
 		disableExpire:    options.DisableExpire,
 		independentCache: options.IndependentCache,
 		roundRobinCache:  options.RoundRobinCache,
+		minCacheTTL:      options.MinCacheTTL,
+		maxCacheTTL:      options.MaxCacheTTL,
 		hosts:            options.Hosts,
 		initRDRCFunc:     options.RDRC,
 		logger:           options.Logger,
+	}
+	if client.maxCacheTTL == 0 {
+		client.maxCacheTTL = 86400
+	}
+	if client.minCacheTTL > client.maxCacheTTL {
+		client.maxCacheTTL = client.minCacheTTL
 	}
 	if client.timeout == 0 {
 		client.timeout = DefaultTimeout
@@ -495,28 +507,34 @@ func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transp
 			}
 		}
 	}
-	var timeToLive int
+	var timeToLive uint32
 	for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
 		for _, record := range recordList {
-			if timeToLive == 0 || record.Header().Ttl > 0 && int(record.Header().Ttl) < timeToLive {
-				timeToLive = int(record.Header().Ttl)
+			if timeToLive == 0 || record.Header().Ttl > 0 && record.Header().Ttl < timeToLive {
+				timeToLive = record.Header().Ttl
 			}
 		}
 	}
+	if timeToLive < c.minCacheTTL {
+		timeToLive = c.minCacheTTL
+	}
+	if timeToLive > c.maxCacheTTL {
+		timeToLive = c.maxCacheTTL
+	}
 	if rewriteTTL, loaded := RewriteTTLFromContext(ctx); loaded {
-		timeToLive = int(rewriteTTL)
+		timeToLive = rewriteTTL
 	}
 	for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
 		for _, record := range recordList {
-			record.Header().Ttl = uint32(timeToLive)
+			record.Header().Ttl = timeToLive
 		}
 	}
 	response.Id = messageId
 	response.MsgHdr.Authoritative = true
 	if !disableCache {
-		c.storeCache(transport, question, response, timeToLive)
+		c.storeCache(transport, question, response, int(timeToLive))
 	}
-	logExchangedResponse(c.logger, ctx, response, timeToLive)
+	logExchangedResponse(c.logger, ctx, response, int(timeToLive))
 	return response, err
 }
 
