@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -97,6 +98,8 @@ type Client struct {
 	disableExpire    bool
 	independentCache bool
 	roundRobinCache  bool
+	useStaleCache    bool
+	staleCache       uint32
 	minCacheTTL      uint32
 	maxCacheTTL      uint32
 	hosts            *Hosts
@@ -105,6 +108,9 @@ type Client struct {
 	logger           logger.ContextLogger
 	cache            *cache.LruCache[dns.Question, *dnsMsg]
 	transportCache   *cache.LruCache[transportCacheKey, *dnsMsg]
+	cacheUpdating    *cache.LruCache[dns.Question, struct{}]
+	transportCacheUpdating *cache.LruCache[transportCacheKey, struct{}]
+	updateAccess     sync.Mutex
 }
 
 type RDRCStore interface {
@@ -114,9 +120,10 @@ type RDRCStore interface {
 }
 
 type dnsMsg struct {
-	ipv4Index int32
-	ipv6Index int32
-	msg       *dns.Msg
+	ipv4Index   int32
+	ipv6Index   int32
+	msg         *dns.Msg
+	expiredTime time.Time
 }
 
 func removeAnswersOfType(answers []dns.RR, rrType uint16) []dns.RR {
@@ -200,6 +207,7 @@ type ClientOptions struct {
 	DisableExpire    bool
 	IndependentCache bool
 	RoundRobinCache  bool
+	StaleCache       uint32
 	MinCacheTTL      uint32
 	MaxCacheTTL      uint32
 	Hosts            *Hosts
@@ -214,6 +222,8 @@ func NewClient(options ClientOptions) *Client {
 		disableExpire:    options.DisableExpire,
 		independentCache: options.IndependentCache,
 		roundRobinCache:  options.RoundRobinCache,
+		useStaleCache:    options.StaleCache > 0,
+		staleCache:       options.StaleCache,
 		minCacheTTL:      options.MinCacheTTL,
 		maxCacheTTL:      options.MaxCacheTTL,
 		hosts:            options.Hosts,
@@ -232,8 +242,10 @@ func NewClient(options ClientOptions) *Client {
 	if !client.disableCache {
 		if !client.independentCache {
 			client.cache = cache.New[dns.Question, *dnsMsg]()
+			client.cacheUpdating = cache.New[dns.Question, struct{}]()
 		} else {
 			client.transportCache = cache.New[transportCacheKey, *dnsMsg]()
+			client.transportCacheUpdating = cache.New[transportCacheKey, struct{}]()
 		}
 	}
 	return client
@@ -408,6 +420,19 @@ func (c *Client) Exchange(ctx context.Context, transport Transport, message *dns
 	return c.ExchangeWithResponseCheck(ctx, transport, message, strategy, nil)
 }
 
+type updateDnsCacheContext struct{}
+
+var UpdateDnsCacheContextKey = updateDnsCacheContext{}
+
+func GetUpdateDnsCacheFromContext(ctx context.Context) bool {
+	_, ok := ctx.Value(UpdateDnsCacheContextKey).(struct{})
+	return ok
+}
+
+func AddUpdateDnsCacheToContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, UpdateDnsCacheContextKey, struct{}{})
+}
+
 func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transport, message *dns.Msg, strategy DomainStrategy, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error) {
 	if len(message.Question) == 0 {
 		if c.logger != nil {
@@ -424,6 +449,47 @@ func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transp
 		return &responseMessage, nil
 	}
 	question := message.Question[0]
+	isUpdateCache := GetUpdateDnsCacheFromContext(ctx)
+	if isUpdateCache {
+		var key interface{}
+		isUpdating := func() bool {
+			c.updateAccess.Lock()
+			defer c.updateAccess.Unlock()
+			var exist bool
+			if !c.independentCache {
+				_, exist = c.cacheUpdating.Load(question)
+				if !exist {
+					c.cacheUpdating.Store(question, struct{}{})
+					key = question
+				}
+			} else {
+				transportKey := transportCacheKey{
+					Question:      question,
+					transportName: transport.Name(),
+				}
+				_, exist = c.transportCacheUpdating.Load(transportKey)
+				if !exist {
+					c.transportCacheUpdating.Store(transportKey, struct{}{})
+					key = transportKey
+				}
+			}
+			return exist
+		}()
+		if !isUpdating && key != nil {
+			defer func() {
+				c.updateAccess.Lock()
+				defer c.updateAccess.Unlock()
+				if !c.independentCache {
+					c.cacheUpdating.Delete(key.(dns.Question))
+				} else {
+					c.transportCacheUpdating.Delete(key.(transportCacheKey))
+				}
+			}()
+		}
+		if isUpdating {
+			return nil, nil
+		}
+	}
 	clientSubnet, clientSubnetLoaded := ClientSubnetFromContext(ctx)
 	if clientSubnetLoaded {
 		message = SetClientSubnet(message, clientSubnet, true)
@@ -433,7 +499,7 @@ func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transp
 		len(message.Extra) == 0 &&
 		!clientSubnetLoaded
 	disableCache := !isSimpleRequest || c.disableCache || DisableCacheFromContext(ctx)
-	if !disableCache {
+	if !disableCache && !isUpdateCache {
 		response, ttl := c.loadResponse(question, transport)
 		if response != nil {
 			logCachedResponse(c.logger, ctx, response, ttl)
@@ -628,10 +694,14 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 		}
 		return sortAddresses(response4, response6, strategy), nil
 	}
+	isUpdateCache := GetUpdateDnsCacheFromContext(ctx)
+	if isUpdateCache {
+		return nil, nil
+	}
 	disableCache := c.disableCache || DisableCacheFromContext(ctx)
-	if !disableCache {
+	if !disableCache && !isUpdateCache {
 		if strategy == DomainStrategyUseIPv4 {
-			response, err := c.questionCache(dns.Question{
+			response, _, err := c.questionCache(dns.Question{
 				Name:   dnsName,
 				Qtype:  dns.TypeA,
 				Qclass: dns.ClassINET,
@@ -640,7 +710,7 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 				return response, err
 			}
 		} else if strategy == DomainStrategyUseIPv6 {
-			response, err := c.questionCache(dns.Question{
+			response, _, err := c.questionCache(dns.Question{
 				Name:   dnsName,
 				Qtype:  dns.TypeAAAA,
 				Qclass: dns.ClassINET,
@@ -649,12 +719,12 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 				return response, err
 			}
 		} else {
-			response4, _ := c.questionCache(dns.Question{
+			response4, _, _ := c.questionCache(dns.Question{
 				Name:   dnsName,
 				Qtype:  dns.TypeA,
 				Qclass: dns.ClassINET,
 			}, transport)
-			response6, _ := c.questionCache(dns.Question{
+			response6, _, _ := c.questionCache(dns.Question{
 				Name:   dnsName,
 				Qtype:  dns.TypeAAAA,
 				Qclass: dns.ClassINET,
@@ -778,57 +848,60 @@ func (c *Client) ClearCache() {
 	}
 }
 
-func (c *Client) LookupCache(ctx context.Context, domain string, strategy DomainStrategy) ([]netip.Addr, bool) {
+func (c *Client) LookupCache(ctx context.Context, domain string, strategy DomainStrategy) ([]netip.Addr, bool, bool) {
 	if c.independentCache {
-		return nil, false
+		return nil, false, false
 	}
 	disableCache := c.disableCache || DisableCacheFromContext(ctx)
 	if disableCache {
-		return nil, false
+		return nil, false, false
 	}
 	if dns.IsFqdn(domain) {
 		domain = domain[:len(domain)-1]
 	}
 	dnsName := dns.Fqdn(domain)
 	if strategy == DomainStrategyUseIPv4 {
-		response, err := c.questionCache(dns.Question{
+		response, ttl, err := c.questionCache(dns.Question{
 			Name:   dnsName,
 			Qtype:  dns.TypeA,
 			Qclass: dns.ClassINET,
 		}, nil)
 		if err != ErrNotCached {
-			return response, true
+			return response, true, ttl <= 1
 		}
 	} else if strategy == DomainStrategyUseIPv6 {
-		response, err := c.questionCache(dns.Question{
+		response, ttl, err := c.questionCache(dns.Question{
 			Name:   dnsName,
 			Qtype:  dns.TypeAAAA,
 			Qclass: dns.ClassINET,
 		}, nil)
 		if err != ErrNotCached {
-			return response, true
+			return response, true, ttl <= 1
 		}
 	} else {
-		response4, _ := c.questionCache(dns.Question{
+		response4, ttl4, _ := c.questionCache(dns.Question{
 			Name:   dnsName,
 			Qtype:  dns.TypeA,
 			Qclass: dns.ClassINET,
 		}, nil)
-		response6, _ := c.questionCache(dns.Question{
+		response6, ttl6, _ := c.questionCache(dns.Question{
 			Name:   dnsName,
 			Qtype:  dns.TypeAAAA,
 			Qclass: dns.ClassINET,
 		}, nil)
 		if len(response4) > 0 || len(response6) > 0 {
-			return sortAddresses(response4, response6, strategy), true
+			if ttl6 > ttl4 {
+				ttl4 = ttl6
+			}
+			return sortAddresses(response4, response6, strategy), true, ttl4 <= 1
 		}
 	}
-	return nil, false
+	return nil, false, false
 }
 
-func (c *Client) ExchangeCache(ctx context.Context, message *dns.Msg) (*dns.Msg, bool) {
+func (c *Client) ExchangeCache(ctx context.Context, message *dns.Msg) (*dns.Msg, bool, bool) {
 	if c.independentCache || len(message.Question) != 1 {
-		return nil, false
+		return nil, false, false
 	}
 	question := message.Question[0]
 	_, clientSubnetLoaded := transportNameFromContext(ctx)
@@ -838,15 +911,15 @@ func (c *Client) ExchangeCache(ctx context.Context, message *dns.Msg) (*dns.Msg,
 		!clientSubnetLoaded
 	disableCache := !isSimpleRequest || c.disableCache || DisableCacheFromContext(ctx)
 	if disableCache {
-		return nil, false
+		return nil, false, false
 	}
 	response, ttl := c.loadResponse(question, nil)
 	if response == nil {
-		return nil, false
+		return nil, false, false
 	}
 	logCachedResponse(c.logger, ctx, response, ttl)
 	response.Id = message.Id
-	return response, true
+	return response, true, ttl <= 1
 }
 
 func sortAddresses(response4 []netip.Addr, response6 []netip.Addr, strategy DomainStrategy) []netip.Addr {
@@ -861,25 +934,32 @@ func (c *Client) storeCache(transport Transport, question dns.Question, message 
 	if timeToLive == 0 {
 		return
 	}
+	pdnsMsg := &dnsMsg{
+		msg: message,
+	}
 	if c.disableExpire {
 		if !c.independentCache {
-			c.cache.Store(question, &dnsMsg{msg: message})
+			c.cache.Store(question, pdnsMsg)
 		} else {
 			c.transportCache.Store(transportCacheKey{
 				Question:      question,
 				transportName: transport.Name(),
-			}, &dnsMsg{msg: message})
+			}, pdnsMsg)
 		}
 		return
 	}
 	expireAt := time.Now().Add(time.Second * time.Duration(timeToLive))
+	pdnsMsg.expiredTime = expireAt
+	if c.useStaleCache {
+		expireAt = expireAt.Add(time.Second * time.Duration(c.staleCache))
+	}
 	if !c.independentCache {
-		c.cache.StoreWithExpire(question, &dnsMsg{msg: message}, expireAt)
+		c.cache.StoreWithExpire(question, pdnsMsg, expireAt)
 	} else {
 		c.transportCache.StoreWithExpire(transportCacheKey{
 			Question:      question,
 			transportName: transport.Name(),
-		}, &dnsMsg{msg: message}, expireAt)
+		}, pdnsMsg, expireAt)
 	}
 }
 
@@ -910,14 +990,15 @@ func (c *Client) lookupToExchange(ctx context.Context, transport Transport, name
 		Qtype:  qType,
 		Qclass: dns.ClassINET,
 	}
+	isUpdateCache := GetUpdateDnsCacheFromContext(ctx)
 	disableCache := c.disableCache || DisableCacheFromContext(ctx)
-	if !disableCache {
-		cachedAddresses, err := c.questionCache(question, transport)
+	if !disableCache && !isUpdateCache {
+		cachedAddresses, _, err := c.questionCache(question, transport)
 		if err != ErrNotCached {
 			return cachedAddresses, err
 		}
 	}
-	message := dns.Msg{
+	message := &dns.Msg{
 		MsgHdr: dns.MsgHdr{
 			RecursionDesired: true,
 		},
@@ -928,7 +1009,7 @@ func (c *Client) lookupToExchange(ctx context.Context, transport Transport, name
 		err      error
 	)
 	if responseChecker != nil {
-		response, err = c.ExchangeWithResponseCheck(ctx, transport, &message, strategy, func(response *dns.Msg) bool {
+		response, err = c.ExchangeWithResponseCheck(ctx, transport, message, strategy, func(response *dns.Msg) bool {
 			addresses, addrErr := MessageToAddresses(response)
 			if addrErr != nil {
 				return false
@@ -936,20 +1017,21 @@ func (c *Client) lookupToExchange(ctx context.Context, transport Transport, name
 			return responseChecker(addresses)
 		})
 	} else {
-		response, err = c.Exchange(ctx, transport, &message, strategy)
+		response, err = c.Exchange(ctx, transport, message, strategy)
 	}
-	if err != nil {
+	if response == nil || err != nil {
 		return nil, err
 	}
 	return MessageToAddresses(response)
 }
 
-func (c *Client) questionCache(question dns.Question, transport Transport) ([]netip.Addr, error) {
-	response, _ := c.loadResponse(question, transport)
+func (c *Client) questionCache(question dns.Question, transport Transport) ([]netip.Addr, int, error) {
+	response, ttl := c.loadResponse(question, transport)
 	if response == nil {
-		return nil, ErrNotCached
+		return nil, 0, ErrNotCached
 	}
-	return MessageToAddresses(response)
+	addr, err := MessageToAddresses(response)
+	return addr, ttl, err
 }
 
 func (c *Client) getRoundRobin(response *dnsMsg) *dns.Msg {
@@ -1005,6 +1087,17 @@ func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.
 			return nil, 0
 		}
 		response = c.getRoundRobin(resp)
+		if c.useStaleCache {
+			expireAt = resp.expiredTime
+			if timeNow.After(expireAt) {
+				for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
+					for _, record := range recordList {
+						record.Header().Ttl = 1
+					}
+				}
+				return response, 1
+			}
+		}
 		var originTTL int
 		for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
 			for _, record := range recordList {
